@@ -3,6 +3,7 @@ package com.example.yolodemo
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.RectF
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
@@ -10,13 +11,19 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.camera.view.TransformExperimental
+import androidx.camera.view.transform.CoordinateTransform
+import androidx.camera.view.transform.ImageProxyTransformFactory
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.doOnLayout
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+@androidx.annotation.OptIn(TransformExperimental::class)
 class MainActivity : AppCompatActivity() {
     private lateinit var detector: ObjectDetector
     private lateinit var cameraExecutor: ExecutorService
@@ -24,6 +31,8 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        findViewById<PreviewView>(R.id.viewFinder).implementationMode =
+            PreviewView.ImplementationMode.COMPATIBLE
 
         try {
             detector = ObjectDetector(this).apply { initialize() }
@@ -34,7 +43,7 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         if (allPermissionsGranted()) {
-            startCamera()
+            findViewById<PreviewView>(R.id.viewFinder).doOnLayout { startCamera() }
         } else {
             ActivityCompat.requestPermissions(
                 this,
@@ -50,12 +59,16 @@ class MainActivity : AppCompatActivity() {
 
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
+            val previewView = findViewById<PreviewView>(R.id.viewFinder)
+            val viewPort = previewView.viewPort ?: return@addListener
+            val transformFactory = ImageProxyTransformFactory().apply {
+                isUsingCropRect = true
+                isUsingRotationDegrees = true
+            }
 
             val preview = Preview.Builder().build()
                 .also {
-                    it.setSurfaceProvider(
-                        findViewById<PreviewView>(R.id.viewFinder).surfaceProvider
-                    )
+                    it.setSurfaceProvider(previewView.surfaceProvider)
                 }
 
             val analyzer = ImageAnalysis.Builder()
@@ -66,25 +79,42 @@ class MainActivity : AppCompatActivity() {
                     analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                         try {
                             val bitmap = imageProxy.toBitmap()
+                            val crop = imageProxy.cropRect
+                            val croppedBitmap = Bitmap.createBitmap(
+                                bitmap, crop.left, crop.top, crop.width(), crop.height()
+                            )
+                            val sourceTransform = transformFactory.getOutputTransform(imageProxy)
 
                             // Fix rotation
                             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
                             val matrix = android.graphics.Matrix()
                             matrix.postRotate(rotationDegrees.toFloat())
                             val rotatedBitmap = Bitmap.createBitmap(
-                                bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+                                croppedBitmap, 0, 0, croppedBitmap.width, croppedBitmap.height, matrix, true
                             )
 
                             val results = detector.detect(rotatedBitmap)
                             Log.d("YOLO", "Rotation: $rotationDegrees | Detections: ${results.size} | Size: ${rotatedBitmap.width}x${rotatedBitmap.height}")
 
                             runOnUiThread {
+                                val targetTransform = previewView.outputTransform
+                                val mappedResults = if (targetTransform == null) {
+                                    emptyList()
+                                } else {
+                                    val transform = CoordinateTransform(sourceTransform, targetTransform)
+                                    results.map { detection ->
+                                        val box = RectF(detection.boundingBox)
+                                        transform.mapRect(box)
+                                        detection.copy(boundingBox = box)
+                                    }
+                                }
                                 findViewById<OverlayView>(R.id.overlay)
-                                    .setDetections(results, rotatedBitmap.width, rotatedBitmap.height)
+                                    .setDetections(mappedResults)
                             }
 
-                            bitmap.recycle()
                             rotatedBitmap.recycle()
+                            if (croppedBitmap !== rotatedBitmap) croppedBitmap.recycle()
+                            if (bitmap !== croppedBitmap && bitmap !== rotatedBitmap) bitmap.recycle()
 
                         } catch (e: Exception) {
                             Log.e("YOLO", "Detection error: ${e.message}", e)
@@ -99,8 +129,11 @@ class MainActivity : AppCompatActivity() {
                 cameraProvider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analyzer
+                    UseCaseGroup.Builder()
+                        .setViewPort(viewPort)
+                        .addUseCase(preview)
+                        .addUseCase(analyzer)
+                        .build()
                 )
                 Log.d("YOLO", "Camera bound successfully")
             } catch (e: Exception) {
@@ -118,7 +151,7 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 10 && grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startCamera()
+            findViewById<PreviewView>(R.id.viewFinder).doOnLayout { startCamera() }
         } else {
             Log.e("YOLO", "Camera permission denied")
             finish()

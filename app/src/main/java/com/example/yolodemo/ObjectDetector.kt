@@ -2,6 +2,8 @@ package com.example.yolodemo
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.Interpreter
@@ -10,6 +12,7 @@ import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import kotlin.math.roundToInt
 
 class ObjectDetector(private val context: Context) {
     private lateinit var interpreter: Interpreter
@@ -20,6 +23,43 @@ class ObjectDetector(private val context: Context) {
 
     data class Detection(val label: String, val confidence: Float, val boundingBox: RectF)
 
+    internal class LetterboxTransform(val imageWidth: Int, val imageHeight: Int, val inputSize: Int) {
+        private val scale = minOf(inputSize.toFloat() / imageWidth, inputSize.toFloat() / imageHeight)
+        val resizedWidth = (imageWidth * scale).roundToInt().coerceIn(1, inputSize)
+        val resizedHeight = (imageHeight * scale).roundToInt().coerceIn(1, inputSize)
+        val paddingLeft = (inputSize - resizedWidth) / 2
+        val paddingTop = (inputSize - resizedHeight) / 2
+
+        fun prepare(bitmap: Bitmap): Bitmap {
+            val scaled = Bitmap.createScaledBitmap(bitmap, resizedWidth, resizedHeight, true)
+            val padded = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+            Canvas(padded).apply {
+                drawColor(Color.rgb(114, 114, 114))
+                drawBitmap(scaled, paddingLeft.toFloat(), paddingTop.toFloat(), null)
+            }
+            if (scaled !== bitmap) scaled.recycle()
+            return padded
+        }
+
+        fun mapBox(cx: Float, cy: Float, width: Float, height: Float): RectF? {
+            if (!cx.isFinite() || !cy.isFinite() || !width.isFinite() || !height.isFinite() ||
+                width <= 0f || height <= 0f) return null
+            val scaleX = resizedWidth.toFloat() / imageWidth
+            val scaleY = resizedHeight.toFloat() / imageHeight
+            val box = RectF(
+                ((cx - width / 2) * inputSize - paddingLeft) / scaleX,
+                ((cy - height / 2) * inputSize - paddingTop) / scaleY,
+                ((cx + width / 2) * inputSize - paddingLeft) / scaleX,
+                ((cy + height / 2) * inputSize - paddingTop) / scaleY
+            )
+            box.left = box.left.coerceIn(0f, imageWidth.toFloat())
+            box.top = box.top.coerceIn(0f, imageHeight.toFloat())
+            box.right = box.right.coerceIn(0f, imageWidth.toFloat())
+            box.bottom = box.bottom.coerceIn(0f, imageHeight.toFloat())
+            return box.takeIf { it.width() > 0f && it.height() > 0f }
+        }
+    }
+
     fun initialize() {
         try {
             context.assets.open("labels.txt").bufferedReader().forEachLine {
@@ -27,7 +67,7 @@ class ObjectDetector(private val context: Context) {
             }
             Log.d("YOLO", "Labels loaded: ${labels.size} -> $labels")
 
-            val modelBuffer = loadModelFile("best_integer_quant.tflite")
+            val modelBuffer = loadModelFile("yolov8n_float32.tflite")
             val options = Interpreter.Options().apply {
                 numThreads = 4
             }
@@ -62,8 +102,9 @@ class ObjectDetector(private val context: Context) {
     }
 
     fun detect(bitmap: Bitmap): List<Detection> {
+        val transform = LetterboxTransform(bitmap.width, bitmap.height, inputSize)
+        val resized = transform.prepare(bitmap)
         return try {
-            val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
             val inputType = interpreter.getInputTensor(0).dataType()
 
             if (inputType == DataType.FLOAT32) {
@@ -80,7 +121,7 @@ class ObjectDetector(private val context: Context) {
                 val outputShape = interpreter.getOutputTensor(0).shape()
                 val outputBuffer = TensorBuffer.createFixedSize(outputShape, DataType.FLOAT32)
                 interpreter.run(inputArray, outputBuffer.buffer.rewind())
-                parseOutput(outputBuffer.floatArray, bitmap.width, bitmap.height)
+                parseOutput(outputBuffer.floatArray, transform)
 
             } else {
                 // INT8/UINT8 model: send raw bytes [0-255]
@@ -111,23 +152,25 @@ class ObjectDetector(private val context: Context) {
                     outputBuffer.floatArray
                 }
 
-                parseOutput(floatOutput, bitmap.width, bitmap.height)
+                parseOutput(floatOutput, transform)
             }
 
         } catch (e: Exception) {
             Log.e("YOLO", "Detection error: ${e.message}", e)
             emptyList()
+        } finally {
+            resized.recycle()
         }
     }
 
-    private fun parseOutput(output: FloatArray, imgW: Int, imgH: Int): List<Detection> {
+    private fun parseOutput(output: FloatArray, transform: LetterboxTransform): List<Detection> {
         val detections = mutableListOf<Detection>()
         val numClasses = labels.size
         val numBoxes = 8400
 
         Log.d("YOLO", "Output array size: ${output.size}")
         Log.d("YOLO", "Max value in output: ${output.max()}")
-        Log.d("YOLO", "imgW: $imgW, imgH: $imgH")
+        Log.d("YOLO", "Letterbox: ${transform.imageWidth}x${transform.imageHeight} -> ${transform.resizedWidth}x${transform.resizedHeight}, padding=${transform.paddingLeft},${transform.paddingTop}")
 
         for (i in 0 until numBoxes) {
             var maxConf = 0f
@@ -142,19 +185,18 @@ class ObjectDetector(private val context: Context) {
             }
 
             if (maxConf >= confThreshold && classIdx >= 0) {
-                // Coordinates are already normalized (0-1), just scale to image size
-                val cx = output[0 * numBoxes + i] * imgW
-                val cy = output[1 * numBoxes + i] * imgH
-                val w  = output[2 * numBoxes + i] * imgW
-                val h  = output[3 * numBoxes + i] * imgH
+                val box = transform.mapBox(
+                    output[0 * numBoxes + i], output[1 * numBoxes + i],
+                    output[2 * numBoxes + i], output[3 * numBoxes + i]
+                ) ?: continue
 
-                Log.d("YOLO", "Detection: label=${labels[classIdx]}, conf=$maxConf, cx=$cx, cy=$cy, w=$w, h=$h")
+                Log.d("YOLO", "Detection: label=${labels[classIdx]}, conf=$maxConf, box=$box")
 
                 detections.add(
                     Detection(
                         label = labels[classIdx],
                         confidence = maxConf,
-                        boundingBox = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+                        boundingBox = box
                     )
                 )
             }

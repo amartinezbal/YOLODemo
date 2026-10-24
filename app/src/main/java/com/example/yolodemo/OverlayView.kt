@@ -14,8 +14,6 @@ class OverlayView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     private var detections: List<ObjectDetector.Detection> = emptyList()
-    private var imageWidth: Int = 1
-    private var imageHeight: Int = 1
 
     // Corner length as fraction of box size
     private val cornerLengthRatio = 0.2f
@@ -59,28 +57,18 @@ class OverlayView @JvmOverloads constructor(
         Color.parseColor("#FF2D55")  // pink
     )
 
-    fun setDetections(results: List<ObjectDetector.Detection>, imgWidth: Int, imgHeight: Int) {
+    fun setDetections(results: List<ObjectDetector.Detection>) {
         detections = results
-        imageWidth = imgWidth
-        imageHeight = imgHeight
         invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        val scaleX = width.toFloat() / imageWidth.toFloat()
-        val scaleY = height.toFloat() / imageHeight.toFloat()
-
         for ((index, det) in detections.withIndex()) {
             val color = colorPalette[index % colorPalette.size]
 
-            val scaledBox = RectF(
-                det.boundingBox.left * scaleX,
-                det.boundingBox.top * scaleY,
-                det.boundingBox.right * scaleX,
-                det.boundingBox.bottom * scaleY
-            )
+            val scaledBox = RectF(det.boundingBox)
 
             // Clamp box to screen bounds
             scaledBox.left   = scaledBox.left.coerceAtLeast(0f)
